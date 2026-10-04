@@ -23,7 +23,6 @@ var upgrader = websocket.Upgrader{
 	CheckOrigin:     func(r *http.Request) bool { return true },
 }
 
-// agentPool keeps one agent instance per conversation so history persists.
 var (
 	agentPool   = map[string]*agent.Agent{}
 	agentPoolMu sync.Mutex
@@ -52,7 +51,6 @@ func (h *WSHandler) Handle(c *gin.Context) {
 	}
 	defer conn.Close()
 
-	// Load or create agent for this conversation
 	a, err := h.getOrCreateAgent(c.Request.Context(), convID, userID)
 	if err != nil {
 		conn.WriteJSON(agent.Event{Type: agent.EventError, Content: "failed to start agent: " + err.Error()})
@@ -78,14 +76,13 @@ func (h *WSHandler) Handle(c *gin.Context) {
 			continue
 		}
 
-		// Persist user message to DB
 		h.saveMessage(convID, "user", incoming.Message, "", nil)
 
 		events := make(chan agent.Event, 256)
 		var assistantContent string
 
 		go func() {
-			a.Run(context.Background(), incoming.Message, events)
+			a.Run(context.Background(), incoming.Message, userID, h.db, events)
 		}()
 
 		for ev := range events {
@@ -95,7 +92,6 @@ func (h *WSHandler) Handle(c *gin.Context) {
 			}
 		}
 
-		// Persist assistant message to DB
 		if assistantContent != "" {
 			h.saveMessage(convID, "assistant", assistantContent, "", nil)
 		}
@@ -110,21 +106,21 @@ func (h *WSHandler) getOrCreateAgent(ctx context.Context, convID, userID string)
 		return a, nil
 	}
 
-	// Load agent config from DB via conversation → agent
-	var agentID, agentName, systemPrompt, sandboxID string
+	var agentID, agentName, systemPrompt, sandboxID, userModel string
 	err := h.db.QueryRow(ctx,
-		`SELECT ag.id, ag.name, ag.system_prompt, COALESCE(ag.sandbox_id, '')
-		 FROM conversations c JOIN agents ag ON c.agent_id = ag.id
+		`SELECT ag.id, ag.name, ag.system_prompt, COALESCE(ag.sandbox_id, ''), COALESCE(u.assigned_model, 'gpt-4o')
+		 FROM conversations c
+		 JOIN agents ag ON c.agent_id = ag.id
+		 JOIN users u ON c.user_id = u.id
 		 WHERE c.id = $1 AND c.user_id = $2`, convID, userID).
-		Scan(&agentID, &agentName, &systemPrompt, &sandboxID)
+		Scan(&agentID, &agentName, &systemPrompt, &sandboxID, &userModel)
 	if err != nil {
-		// Fallback: create a default agent on-the-fly
 		agentID = uuid.New().String()
 		agentName = "Assistant"
-		systemPrompt = "You are a helpful AI assistant with access to a Linux computer. Use your tools to complete tasks thoroughly and accurately. When you need to run code, search the web, or manage files, use the appropriate tools."
+		systemPrompt = "You are a helpful AI assistant with access to a Linux computer. Use your tools to complete tasks thoroughly and accurately."
+		userModel = h.cfg.LLMModel
 	}
 
-	// Provision sandbox
 	sandboxMgr, err := sandbox.NewManager(h.cfg.SandboxImage, h.cfg.WorkspacePath)
 	if err != nil {
 		return nil, err
@@ -132,11 +128,9 @@ func (h *WSHandler) getOrCreateAgent(ctx context.Context, convID, userID string)
 
 	sandboxInfo, err := sandboxMgr.GetOrCreate(ctx, agentID)
 	if err != nil {
-		// Sandbox may not be available (image not built yet) — run without it
 		sandboxInfo = &sandbox.SandboxInfo{ContainerID: ""}
 	}
 
-	// Update sandbox ID in DB
 	if sandboxInfo.ContainerID != "" {
 		h.db.Exec(ctx,
 			`UPDATE agents SET sandbox_id = $1, novnc_port = $2, vnc_port = $3, status = 'running'
@@ -144,7 +138,8 @@ func (h *WSHandler) getOrCreateAgent(ctx context.Context, convID, userID string)
 			sandboxInfo.ContainerID, sandboxInfo.NoVNCPort, sandboxInfo.VNCPort, agentID)
 	}
 
-	llmClient := llm.NewClient(h.cfg.LLMBaseURL, h.cfg.LLMAPIKey, h.cfg.LLMModel)
+	// Dynamic model resolution (user-assigned model via OmniRoute)
+	llmClient := llm.NewClient(h.cfg.LLMBaseURL, h.cfg.LLMAPIKey, userModel)
 	a := agent.New(agentID, agentName, systemPrompt, llmClient, sandboxMgr, sandboxInfo.ContainerID)
 
 	agentPool[convID] = a

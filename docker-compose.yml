@@ -10,7 +10,7 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-secret}
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./backend/migrations:/docker-entrypoint-initdb.d
+      - ./migrations:/docker-entrypoint-initdb.d
     ports:
       - "5432:5432"
     healthcheck:
@@ -30,9 +30,24 @@ services:
       timeout: 3s
       retries: 5
 
+  # OmniRoute Unified Model Gateway (OpenRouter, Gemini, Codex, Antigravity, Anthropic)
+  omniroute:
+    image: python:3.11-slim
+    command: >
+      bash -c "pip install --no-cache-dir fastapi uvicorn requests httpx litellm &&
+               uvicorn --host 0.0.0.0 --port 8000 --factory litellm.proxy.proxy_server:app"
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      OPENAI_API_KEY: ${LLM_API_KEY}
+
   backend:
     build:
-      context: ./backend
+      context: .
       dockerfile: Dockerfile
     restart: unless-stopped
     ports:
@@ -41,11 +56,11 @@ services:
       PORT: "8080"
       DATABASE_URL: postgres://grokagent:${POSTGRES_PASSWORD:-secret}@postgres:5432/grokagent
       REDIS_URL: redis://redis:6379
-      LLM_BASE_URL: ${LLM_BASE_URL:-https://api.openai.com/v1}
-      LLM_API_KEY: ${LLM_API_KEY}
+      LLM_BASE_URL: ${LLM_BASE_URL:-http://omniroute:8000/v1}
+      LLM_API_KEY: ${LLM_API_KEY:-omniroute}
       LLM_MODEL: ${LLM_MODEL:-gpt-4o}
       EMBED_API_KEY: ${LLM_API_KEY}
-      EMBED_BASE_URL: ${LLM_BASE_URL:-https://api.openai.com/v1}
+      EMBED_BASE_URL: ${LLM_BASE_URL:-http://omniroute:8000/v1}
       JWT_SECRET: ${JWT_SECRET:-change-me-in-production}
       SANDBOX_IMAGE: grok-agent-sandbox:latest
       WORKSPACE_PATH: /workspaces
@@ -58,10 +73,12 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      omniroute:
+        condition: service_started
 
   frontend:
     build:
-      context: ./frontend
+      context: ../frontend
       dockerfile: Dockerfile
     restart: unless-stopped
     ports:

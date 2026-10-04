@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"github.com/grok-agent/backend/internal/llm"
 	"github.com/grok-agent/backend/internal/tools"
 )
@@ -33,8 +35,30 @@ type Event struct {
 const maxIterations = 25
 
 // Run executes the agent loop for a user message, streaming events to the channel.
-func (a *Agent) Run(ctx context.Context, userMessage string, events chan<- Event) error {
+func (a *Agent) Run(ctx context.Context, userMessage string, userID string, db *pgxpool.Pool, events chan<- Event) error {
 	defer close(events)
+
+	// Check User Budget & Status before running loop
+	if db != nil && userID != "" {
+		var status, assignedModel string
+		var budget, spent float64
+		err := db.QueryRow(ctx,
+			`SELECT status, COALESCE(assigned_model, 'gpt-4o'), monthly_budget_usd, spent_this_month_usd FROM users WHERE id = $1`,
+			userID,
+		).Scan(&status, &assignedModel, &budget, &spent)
+
+		if err == nil {
+			if status == "suspended" {
+				events <- Event{Type: EventError, Content: "Account is suspended by administrator."}
+				return fmt.Errorf("account suspended")
+			}
+			if spent >= budget {
+				errMsg := fmt.Sprintf("Monthly budget limit of $%.2f reached ($%.4f spent). Contact admin to increase budget.", budget, spent)
+				events <- Event{Type: EventError, Content: errMsg}
+				return fmt.Errorf("budget limit reached")
+			}
+		}
+	}
 
 	// Inject system prompt on first message
 	if len(a.history) == 0 && a.SystemPrompt != "" {
@@ -96,6 +120,12 @@ func (a *Agent) Run(ctx context.Context, userMessage string, events chan<- Event
 		if err := <-errCh; err != nil && fullContent == "" && len(toolCallsAcc) == 0 {
 			events <- Event{Type: EventError, Content: err.Error()}
 			return err
+		}
+
+		// Estimate spend per iteration & update user spent_this_month_usd
+		if db != nil && userID != "" {
+			// Nominal ~$0.0010 per iteration estimate
+			db.Exec(ctx, `UPDATE users SET spent_this_month_usd = spent_this_month_usd + 0.001000 WHERE id = $1`, userID)
 		}
 
 		// Collect finalized tool calls
