@@ -1,6 +1,14 @@
 version: "3.9"
 
 services:
+  # Pre-build & tag sandbox template image for Go container manager
+  sandbox-template:
+    build:
+      context: ./sandbox
+      dockerfile: Dockerfile
+    image: grok-agent-sandbox:latest
+    entrypoint: ["echo", "Sandbox template built"]
+
   postgres:
     image: pgvector/pgvector:pg16
     restart: unless-stopped
@@ -75,19 +83,8 @@ services:
         condition: service_healthy
       omniroute:
         condition: service_started
-
-  frontend:
-    build:
-      context: ../frontend
-      dockerfile: Dockerfile
-    restart: unless-stopped
-    ports:
-      - "3000:3000"
-    environment:
-      NEXT_PUBLIC_API_URL: http://localhost:8080/api/v1
-      NEXT_PUBLIC_WS_URL: ws://localhost:8080/api/v1/ws
-    depends_on:
-      - backend
+      sandbox-template:
+        condition: service_completed_successfully
 
   searxng:
     image: searxng/searxng:latest
