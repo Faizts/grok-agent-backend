@@ -2,6 +2,7 @@ package memory
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 
 	"github.com/google/uuid"
@@ -28,7 +29,7 @@ type Memory struct {
 
 // Store handles reading and writing agent memories with vector similarity search.
 type Store struct {
-	db      *pgxpool.Pool
+	db       *pgxpool.Pool
 	embedder *Embedder
 }
 
@@ -50,7 +51,7 @@ func (s *Store) Save(ctx context.Context, agentID string, store StoreType, conte
 	_, err = s.db.Exec(ctx,
 		`INSERT INTO memories (id, agent_id, store, content, embedding, metadata)
 		 VALUES ($1, $2, $3, $4, $5, $6)`,
-		uuid.New().String(), agentID, string(store), content, embedding, meta)
+		uuid.New().String(), agentID, string(store), content, vector(embedding), meta)
 	return err
 }
 
@@ -68,7 +69,7 @@ func (s *Store) Search(ctx context.Context, agentID string, store StoreType, que
 		WHERE agent_id = $2 AND store = $3 AND embedding IS NOT NULL
 		ORDER BY embedding <=> $1::vector
 		LIMIT $4
-	`), embedding, agentID, string(store), limit)
+	`), vector(embedding), agentID, string(store), limit)
 	if err != nil {
 		return nil, err
 	}
@@ -78,11 +79,13 @@ func (s *Store) Search(ctx context.Context, agentID string, store StoreType, que
 	for rows.Next() {
 		var m Memory
 		var storeStr string
-		rows.Scan(&m.ID, &storeStr, &m.Content, &m.Score)
+		if err := rows.Scan(&m.ID, &storeStr, &m.Content, &m.Score); err != nil {
+			return nil, err
+		}
 		m.Store = StoreType(storeStr)
 		results = append(results, m)
 	}
-	return results, nil
+	return results, rows.Err()
 }
 
 // TextSearch falls back to ILIKE text search.
@@ -101,11 +104,13 @@ func (s *Store) TextSearch(ctx context.Context, agentID string, store StoreType,
 	for rows.Next() {
 		var m Memory
 		var storeStr string
-		rows.Scan(&m.ID, &storeStr, &m.Content)
+		if err := rows.Scan(&m.ID, &storeStr, &m.Content); err != nil {
+			return nil, err
+		}
 		m.Store = StoreType(storeStr)
 		results = append(results, m)
 	}
-	return results, nil
+	return results, rows.Err()
 }
 
 // Delete removes a memory by ID.
@@ -117,7 +122,7 @@ func (s *Store) Delete(ctx context.Context, agentID, memID string) error {
 
 // BuildContext assembles relevant memories into a string for injecting into the system prompt.
 func (s *Store) BuildContext(ctx context.Context, agentID, query string) string {
-	stores := []StoreType{StoreSolutions, StoreSkills, StoreFragments}
+	stores := []StoreType{StoreMain, StoreSolutions, StoreSkills, StoreFragments}
 	var out string
 
 	for _, store := range stores {
@@ -132,3 +137,5 @@ func (s *Store) BuildContext(ctx context.Context, agentID, query string) string 
 	}
 	return out
 }
+
+func vector(v []float32) string { b, _ := json.Marshal(v); return string(b) }

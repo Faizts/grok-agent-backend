@@ -3,30 +3,37 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
+	"net/url"
 	"sync"
+	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
-	"github.com/jackc/pgx/v5/pgxpool"
-
 	"github.com/grok-agent/backend/internal/agent"
 	"github.com/grok-agent/backend/internal/config"
 	"github.com/grok-agent/backend/internal/llm"
+	"github.com/grok-agent/backend/internal/memory"
 	"github.com/grok-agent/backend/internal/sandbox"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-var upgrader = websocket.Upgrader{
-	ReadBufferSize:  1024,
-	WriteBufferSize: 4096,
-	CheckOrigin:     func(r *http.Request) bool { return true },
-}
+var upgrader = websocket.Upgrader{ReadBufferSize: 1024, WriteBufferSize: 4096, CheckOrigin: func(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true
+	}
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	return u.Hostname() == r.URL.Hostname() || u.Hostname() == hostOnly(r.Host)
+}}
 
-var (
-	agentPool   = map[string]*agent.Agent{}
-	agentPoolMu sync.Mutex
-)
+func hostOnly(host string) string { u, _ := url.Parse("http://" + host); return u.Hostname() }
+
+var activeConversations sync.Map
 
 type WSHandler struct {
 	db  *pgxpool.Pool
@@ -42,113 +49,205 @@ type wsIncoming struct {
 }
 
 func (h *WSHandler) Handle(c *gin.Context) {
-	convID := c.Param("conversation_id")
-	userID := c.GetString("user_id")
-
+	convID, userID := c.Param("conversation_id"), c.GetString("user_id")
+	if !owns(c, h.db, "conversations", convID) {
+		return
+	}
+	if _, busy := activeConversations.LoadOrStore(convID, true); busy {
+		c.JSON(http.StatusConflict, gin.H{"error": "conversation already connected"})
+		return
+	}
+	defer activeConversations.Delete(convID)
 	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
 	if err != nil {
 		return
 	}
 	defer conn.Close()
-
-	a, err := h.getOrCreateAgent(c.Request.Context(), convID, userID)
-	if err != nil {
-		conn.WriteJSON(agent.Event{Type: agent.EventError, Content: "failed to start agent: " + err.Error()})
-		return
-	}
-
-	writeMu := sync.Mutex{}
-	writeEvent := func(e agent.Event) {
-		data, _ := json.Marshal(e)
-		writeMu.Lock()
-		conn.WriteMessage(websocket.TextMessage, data)
-		writeMu.Unlock()
-	}
-
-	for {
-		_, msgBytes, err := conn.ReadMessage()
-		if err != nil {
-			break
-		}
-
-		var incoming wsIncoming
-		if err := json.Unmarshal(msgBytes, &incoming); err != nil || incoming.Message == "" {
-			continue
-		}
-
-		h.saveMessage(convID, "user", incoming.Message, "", nil)
-
-		events := make(chan agent.Event, 256)
-		var assistantContent string
-
-		go func() {
-			a.Run(context.Background(), incoming.Message, userID, h.db, events)
-		}()
-
-		for ev := range events {
-			writeEvent(ev)
-			if ev.Type == agent.EventText {
-				assistantContent += ev.Content
+	ctx, cancel := context.WithCancel(c.Request.Context())
+	defer cancel()
+	incoming := make(chan wsIncoming)
+	go func() {
+		defer cancel()
+		defer close(incoming)
+		conn.SetReadLimit(1024 * 1024)
+		for {
+			var msg wsIncoming
+			if err := conn.ReadJSON(&msg); err != nil {
+				return
+			}
+			if msg.Message == "" {
+				continue
+			}
+			select {
+			case incoming <- msg:
+			case <-ctx.Done():
+				return
 			}
 		}
-
-		if assistantContent != "" {
-			h.saveMessage(convID, "assistant", assistantContent, "", nil)
+	}()
+	write := func(e agent.Event) bool {
+		conn.SetWriteDeadline(time.Now().Add(15 * time.Second))
+		if conn.WriteJSON(e) != nil {
+			cancel()
+			return false
+		}
+		return true
+	}
+	mgr, err := sandbox.NewManager(h.cfg.SandboxImage, h.cfg.WorkspacePath)
+	if err != nil {
+		write(agent.Event{Type: agent.EventError, Content: err.Error()})
+		return
+	}
+	defer mgr.Close()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case msg, ok := <-incoming:
+			if !ok {
+				return
+			}
+			release, err := lockComputer(ctx, h.db, userID)
+			if err != nil {
+				write(agent.Event{Type: agent.EventError, Content: err.Error()})
+				continue
+			}
+			a, err := h.loadAgent(ctx, mgr, convID, userID)
+			if err != nil {
+				release()
+				write(agent.Event{Type: agent.EventError, Content: err.Error()})
+				continue
+			}
+			// Persist the user turn before execution so a refresh or failed provider call cannot erase it.
+			var turnID string
+			if err := h.db.QueryRow(ctx, `INSERT INTO messages(conversation_id,role,content) VALUES($1,'user',$2) RETURNING id`, convID, msg.Message).Scan(&turnID); err != nil {
+				release()
+				write(agent.Event{Type: agent.EventError, Content: "Failed to save message; please retry"})
+				continue
+			}
+			write(agent.Event{Type: "turn_started", TurnID: turnID})
+			baseline, baselineErr := mgr.WorkingFiles(ctx, a.ContainerID, a.ID)
+			before := len(a.History())
+			events := make(chan agent.Event, 256)
+			finished := make(chan error, 1)
+			go func() { finished <- a.Run(ctx, msg.Message, userID, h.db, events) }()
+			for ev := range events {
+				if ev.Type != agent.EventDone {
+					write(ev)
+				}
+			}
+			runErr := <-finished
+			saveCtx, saveCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			newHistory := a.History()[before:]
+			if len(newHistory) > 0 && newHistory[0].Role == "user" {
+				newHistory = newHistory[1:]
+			}
+			err = h.saveHistory(saveCtx, convID, newHistory)
+			if err == nil && baselineErr == nil {
+				filesCtx, filesCancel := context.WithTimeout(context.Background(), 45*time.Second)
+				files, filesErr := mgr.SaveResponseFiles(filesCtx, a.ContainerID, a.ID, turnID, baseline)
+				if filesErr == nil {
+					encoded, _ := json.Marshal(files)
+					_, filesErr = h.db.Exec(filesCtx, `UPDATE messages SET attachments=$1 WHERE id=$2`, encoded, turnID)
+					if filesErr == nil {
+						write(agent.Event{Type: "files", TurnID: turnID, Attachments: files})
+					}
+				}
+				if filesErr != nil {
+					write(agent.Event{Type: agent.EventThinking, Content: "Files could not be attached. Open the agent's Files view."})
+				}
+				filesCancel()
+			}
+			saveCancel()
+			activityCtx, activityCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			_, _ = h.db.Exec(activityCtx, `UPDATE users SET computer_last_active=NOW() WHERE id=$1`, userID)
+			activityCancel()
+			release()
+			if err != nil {
+				write(agent.Event{Type: agent.EventError, Content: "Failed to persist conversation"})
+			} else if runErr == nil {
+				write(agent.Event{Type: agent.EventDone})
+			}
 		}
 	}
 }
 
-func (h *WSHandler) getOrCreateAgent(ctx context.Context, convID, userID string) (*agent.Agent, error) {
-	agentPoolMu.Lock()
-	defer agentPoolMu.Unlock()
-
-	if a, ok := agentPool[convID]; ok {
-		return a, nil
-	}
-
-	var agentID, agentName, systemPrompt, sandboxID, userModel string
-	err := h.db.QueryRow(ctx,
-		`SELECT ag.id, ag.name, ag.system_prompt, COALESCE(ag.sandbox_id, ''), COALESCE(u.assigned_model, 'gpt-4o')
-		 FROM conversations c
-		 JOIN agents ag ON c.agent_id = ag.id
-		 JOIN users u ON c.user_id = u.id
-		 WHERE c.id = $1 AND c.user_id = $2`, convID, userID).
-		Scan(&agentID, &agentName, &systemPrompt, &sandboxID, &userModel)
+func (h *WSHandler) loadAgent(ctx context.Context, mgr *sandbox.Manager, convID, userID string) (*agent.Agent, error) {
+	var id, name, prompt, model string
+	err := h.db.QueryRow(ctx, `SELECT a.id,a.name,COALESCE(a.system_prompt,''),COALESCE(u.assigned_model,$3) FROM conversations c JOIN agents a ON a.id=c.agent_id JOIN users u ON u.id=c.user_id WHERE c.id=$1 AND c.user_id=$2 AND a.user_id=$2 AND u.status='active'`, convID, userID, h.cfg.LLMModel).Scan(&id, &name, &prompt, &model)
 	if err != nil {
-		agentID = uuid.New().String()
-		agentName = "Assistant"
-		systemPrompt = "You are a helpful AI assistant with access to a Linux computer. Use your tools to complete tasks thoroughly and accurately."
-		userModel = h.cfg.LLMModel
+		return nil, fmt.Errorf("conversation unavailable")
 	}
-
-	sandboxMgr, err := sandbox.NewManager(h.cfg.SandboxImage, h.cfg.WorkspacePath)
+	computerID, err := mgr.ComputerKey(ctx, userID, id)
 	if err != nil {
 		return nil, err
 	}
-
-	sandboxInfo, err := sandboxMgr.GetOrCreate(ctx, agentID)
+	if _, err = h.db.Exec(ctx, `UPDATE users SET computer_last_active=NOW() WHERE id=$1`, userID); err != nil {
+		return nil, err
+	}
+	info, err := mgr.GetOrCreate(ctx, computerID)
 	if err != nil {
-		sandboxInfo = &sandbox.SandboxInfo{ContainerID: ""}
+		return nil, fmt.Errorf("sandbox unavailable: %w", err)
 	}
-
-	if sandboxInfo.ContainerID != "" {
-		h.db.Exec(ctx,
-			`UPDATE agents SET sandbox_id = $1, novnc_port = $2, vnc_port = $3, status = 'running'
-			 WHERE id = $4`,
-			sandboxInfo.ContainerID, sandboxInfo.NoVNCPort, sandboxInfo.VNCPort, agentID)
+	if _, err = h.db.Exec(ctx, `UPDATE agents SET sandbox_id=$1,novnc_port=$2,vnc_port=$3,status='running' WHERE user_id=$4 AND (id=$5 OR ($6 AND (sandbox_id IS NULL OR sandbox_id='' OR sandbox_id=$1)))`, info.ContainerID, info.NoVNCPort, info.VNCPort, userID, id, computerID != id); err != nil {
+		return nil, err
 	}
-
-	// Dynamic model resolution (user-assigned model via OmniRoute)
-	llmClient := llm.NewClient(h.cfg.LLMBaseURL, h.cfg.LLMAPIKey, userModel)
-	a := agent.New(agentID, agentName, systemPrompt, llmClient, sandboxMgr, sandboxInfo.ContainerID)
-
-	agentPool[convID] = a
+	ready, readyErr := mgr.ExecShell(ctx, info.ContainerID, "for attempt in $(seq 1 30); do curl -fsS http://localhost:9222/json/version >/dev/null && exit 0; sleep 1; done; exit 1")
+	if readyErr != nil || ready.ExitCode != 0 {
+		return nil, fmt.Errorf("computer browser is not ready; please retry")
+	}
+	a := agent.New(id, name, prompt, llm.NewClient(h.cfg.LLMBaseURL, h.cfg.LLMAPIKey, model), mgr, info.ContainerID)
+	a.ConversationID = convID
+	embedKey := h.cfg.EmbedAPIKey
+	if embedKey == "" {
+		embedKey = h.cfg.LLMAPIKey
+	}
+	a.Configure(h.cfg.SearxngURL, memory.NewEmbedder(h.cfg.EmbedBaseURL, embedKey))
+	rows, err := h.db.Query(ctx, `SELECT role,COALESCE(content,''),COALESCE(tool_name,''),COALESCE(tool_call_id,''),tool_calls FROM messages WHERE conversation_id=$1 ORDER BY sequence`, convID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	history := []llm.Message{}
+	for rows.Next() {
+		var m llm.Message
+		var calls []byte
+		if err = rows.Scan(&m.Role, &m.Content, &m.Name, &m.ToolCallID, &calls); err != nil {
+			return nil, err
+		}
+		if len(calls) > 0 {
+			if err = json.Unmarshal(calls, &m.ToolCalls); err != nil {
+				return nil, err
+			}
+		}
+		history = append(history, m)
+	}
+	if err = rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(history) > 0 && history[0].Role != "system" && prompt != "" {
+		history = append([]llm.Message{{Role: "system", Content: prompt}}, history...)
+	}
+	a.SetHistory(history)
 	return a, nil
 }
-
-func (h *WSHandler) saveMessage(convID, role, content, toolName string, toolInput interface{}) {
-	h.db.Exec(context.Background(),
-		`INSERT INTO messages (id, conversation_id, role, content, tool_name)
-		 VALUES ($1, $2, $3, $4, $5)`,
-		uuid.New().String(), convID, role, content, toolName)
+func (h *WSHandler) saveHistory(ctx context.Context, convID string, messages []llm.Message) error {
+	tx, err := h.db.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	for _, m := range messages {
+		if m.Role == "system" {
+			continue
+		}
+		calls, err := json.Marshal(m.ToolCalls)
+		if err != nil {
+			return err
+		}
+		if _, err = tx.Exec(ctx, `INSERT INTO messages(conversation_id,role,content,tool_name,tool_call_id,tool_calls) VALUES($1,$2,$3,$4,$5,$6)`, convID, m.Role, m.Content, m.Name, m.ToolCallID, calls); err != nil {
+			return err
+		}
+	}
+	return tx.Commit(ctx)
 }

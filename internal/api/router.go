@@ -24,7 +24,7 @@ func setupRouter(s *Server) {
 	v1.POST("/auth/login", authHandler.Login)
 
 	// Protected
-	protected := v1.Group("/", auth.Middleware(s.cfg.JWTSecret))
+	protected := v1.Group("/", auth.Middleware(s.cfg.JWTSecret, s.pool))
 	{
 		// Agents
 		agentHandler := handlers.NewAgentHandler(s.pool)
@@ -32,12 +32,16 @@ func setupRouter(s *Server) {
 		protected.POST("/agents", agentHandler.Create)
 		protected.GET("/agents/:id", agentHandler.Get)
 		protected.DELETE("/agents/:id", agentHandler.Delete)
+		fileHandler := handlers.NewFileHandler(s.pool, s.cfg)
+		protected.GET("/agents/:id/files", fileHandler.List)
+		protected.GET("/agents/:id/files/download", fileHandler.Download)
 
 		// Conversations
 		convHandler := handlers.NewConversationHandler(s.pool)
 		protected.GET("/conversations", convHandler.List)
 		protected.POST("/conversations", convHandler.Create)
 		protected.GET("/conversations/:id/messages", convHandler.Messages)
+		protected.GET("/conversations/:id", convHandler.Get)
 
 		// WebSocket — main chat + streaming
 		wsHandler := handlers.NewWSHandler(s.pool, s.cfg)
@@ -82,6 +86,7 @@ func setupRouter(s *Server) {
 			admin.PATCH("/users/:id", adminHandler.UpdateUser)
 			admin.GET("/models", adminHandler.ListModelRates)
 			admin.POST("/models", adminHandler.SaveModelRate)
+			admin.GET("/provider/models", adminHandler.FetchModels)
 		}
 	}
 }

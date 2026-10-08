@@ -2,8 +2,10 @@ package tools
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	pathpkg "path"
 	"strings"
 
 	"github.com/grok-agent/backend/internal/sandbox"
@@ -40,23 +42,33 @@ func (t *FileTool) Execute(ctx context.Context, input ToolInput) (*ToolResult, e
 	if path == "" {
 		return &ToolResult{Error: "path is required"}, nil
 	}
-	// Always anchor to /workspace
-	if !strings.HasPrefix(path, "/") {
-		path = "/workspace/" + path
+	resolved := pathpkg.Clean(path)
+	if !strings.HasPrefix(resolved, "/") {
+		resolved = pathpkg.Join("/workspace", resolved)
 	}
+	if resolved != "/workspace" && !strings.HasPrefix(resolved, "/workspace/") {
+		return &ToolResult{Error: "path must be inside /workspace"}, nil
+	}
+	path = resolved
+	quoted := shellQuote(path)
+	guard := "resolved=$(realpath -m -- " + quoted + "); case \"$resolved\" in /workspace|/workspace/*) ;; *) echo 'path escapes workspace' >&2; exit 1;; esac; "
 
 	switch action {
 	case "read":
-		res, err := t.manager.ExecShell(ctx, t.containerID, fmt.Sprintf("cat %q", path))
+		res, err := t.manager.ExecShell(ctx, t.containerID, guard+"cat -- "+quoted)
 		if err != nil {
 			return &ToolResult{Error: err.Error()}, nil
+		}
+		if res.ExitCode != 0 {
+			return &ToolResult{Error: fmt.Sprintf("exit code %d: %s", res.ExitCode, res.Stderr)}, nil
 		}
 		return &ToolResult{Output: res.Stdout}, nil
 
 	case "write":
 		content, _ := input["content"].(string)
-		// Write via printf to preserve newlines
-		script := fmt.Sprintf("mkdir -p $(dirname %q) && cat > %q << 'GROKEOF'\n%s\nGROKEOF", path, path, content)
+		encoded := base64.StdEncoding.EncodeToString([]byte(content))
+		script := guard + "mkdir -p -- " + shellQuote(pathpkg.Dir(path)) + " && printf %s " + shellQuote(encoded) + " | base64 -d > " + quoted
+
 		res, err := t.manager.ExecShell(ctx, t.containerID, script)
 		if err != nil {
 			return &ToolResult{Error: err.Error()}, nil
@@ -67,14 +79,17 @@ func (t *FileTool) Execute(ctx context.Context, input ToolInput) (*ToolResult, e
 		return &ToolResult{Output: fmt.Sprintf("Written to %s", path)}, nil
 
 	case "list":
-		res, err := t.manager.ExecShell(ctx, t.containerID, fmt.Sprintf("ls -la %q", path))
+		res, err := t.manager.ExecShell(ctx, t.containerID, guard+"ls -la -- "+quoted)
 		if err != nil {
 			return &ToolResult{Error: err.Error()}, nil
+		}
+		if res.ExitCode != 0 {
+			return &ToolResult{Error: fmt.Sprintf("exit code %d: %s", res.ExitCode, res.Stderr)}, nil
 		}
 		return &ToolResult{Output: res.Stdout}, nil
 
 	case "delete":
-		res, err := t.manager.ExecShell(ctx, t.containerID, fmt.Sprintf("rm -rf %q", path))
+		res, err := t.manager.ExecShell(ctx, t.containerID, guard+"rm -rf -- "+quoted)
 		if err != nil {
 			return &ToolResult{Error: err.Error()}, nil
 		}
@@ -87,3 +102,5 @@ func (t *FileTool) Execute(ctx context.Context, input ToolInput) (*ToolResult, e
 		return &ToolResult{Error: fmt.Sprintf("unknown action: %s", action)}, nil
 	}
 }
+
+func shellQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'" }

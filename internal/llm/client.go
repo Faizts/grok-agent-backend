@@ -3,7 +3,9 @@ package llm
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"sort"
 
 	openai "github.com/sashabaranov/go-openai"
 )
@@ -119,80 +121,98 @@ func (c *Client) Complete(ctx context.Context, messages []Message, tools []map[s
 	return msg, nil
 }
 
-// StreamComplete streams a chat completion, sending chunks to out channel.
+// Model returns the configured billing model.
+func (c *Client) Model() string { return c.model }
+
+// StreamComplete emits text deltas, then finalized tool calls exactly once.
 func (c *Client) StreamComplete(ctx context.Context, messages []Message, tools []map[string]interface{}, out chan<- StreamChunk) error {
 	defer close(out)
-
-	req := openai.ChatCompletionRequest{
-		Model:    c.model,
-		Messages: toOpenAI(messages),
-		Stream:   true,
+	send := func(v StreamChunk) bool {
+		select {
+		case out <- v:
+			return true
+		case <-ctx.Done():
+			return false
+		}
 	}
+	req := openai.ChatCompletionRequest{Model: c.model, Messages: toOpenAI(messages), Stream: true, StreamOptions: &openai.StreamOptions{IncludeUsage: true}}
 	if len(tools) > 0 {
 		req.Tools = toOpenAITools(tools)
 	}
-
 	stream, err := c.client.CreateChatCompletionStream(ctx, req)
 	if err != nil {
-		out <- StreamChunk{Done: true, Error: err.Error()}
+		send(StreamChunk{Done: true, Error: err.Error()})
 		return err
 	}
 	defer stream.Close()
-
-	// Accumulate tool call deltas — the API streams them in fragments
-	toolCallsAcc := map[int]*ToolCall{}
-
+	acc := toolAccumulator{}
+	var usage *TokenUsage
+	finished := false
 	for {
 		chunk, err := stream.Recv()
 		if err != nil {
-			if errors.Is(err, io.EOF) {
-				// Flush any accumulated tool calls
-				if len(toolCallsAcc) > 0 {
-					var tcs []ToolCall
-					for i := 0; i < len(toolCallsAcc); i++ {
-						if tc, ok := toolCallsAcc[i]; ok {
-							tcs = append(tcs, *tc)
-						}
-					}
-					out <- StreamChunk{ToolCalls: tcs}
+			if errors.Is(err, io.EOF) && finished {
+				if !send(StreamChunk{ToolCalls: acc.calls(), Usage: usage, Done: true}) {
+					return ctx.Err()
 				}
-				out <- StreamChunk{Done: true}
 				return nil
 			}
-			out <- StreamChunk{Done: true, Error: err.Error()}
+			if errors.Is(err, io.EOF) {
+				err = fmt.Errorf("LLM stream ended before completion")
+			}
+			send(StreamChunk{Usage: usage, Done: true, Error: err.Error()})
 			return err
 		}
-
+		if chunk.Usage != nil {
+			usage = &TokenUsage{PromptTokens: chunk.Usage.PromptTokens, CompletionTokens: chunk.Usage.CompletionTokens}
+		}
 		if len(chunk.Choices) == 0 {
 			continue
 		}
-
-		delta := chunk.Choices[0].Delta
-
-		// Text content
-		if delta.Content != "" {
-			out <- StreamChunk{Content: delta.Content}
+		choice := chunk.Choices[0]
+		if choice.FinishReason != "" {
+			finished = true
+			if choice.FinishReason == "length" || choice.FinishReason == "content_filter" {
+				err = fmt.Errorf("LLM completion stopped: %s", choice.FinishReason)
+				send(StreamChunk{Done: true, Error: err.Error(), Usage: usage})
+				return err
+			}
 		}
-
-		// Tool call fragments
-		for _, tc := range delta.ToolCalls {
-			idx := tc.Index
-			if idx == nil {
-				continue
-			}
-			if _, exists := toolCallsAcc[*idx]; !exists {
-				toolCallsAcc[*idx] = &ToolCall{Type: "function"}
-			}
-			acc := toolCallsAcc[*idx]
-			if tc.ID != "" {
-				acc.ID = tc.ID
-			}
-			if tc.Function.Name != "" {
-				acc.Function.Name = tc.Function.Name
-			}
-			if tc.Function.Arguments != "" {
-				acc.Function.Arguments += tc.Function.Arguments
-			}
+		if choice.Delta.Content != "" && !send(StreamChunk{Content: choice.Delta.Content}) {
+			return ctx.Err()
+		}
+		for _, tc := range choice.Delta.ToolCalls {
+			acc.add(tc)
 		}
 	}
+}
+
+type toolAccumulator map[int]*ToolCall
+
+func (a toolAccumulator) add(tc openai.ToolCall) {
+	if tc.Index == nil {
+		return
+	}
+	i := *tc.Index
+	if a[i] == nil {
+		a[i] = &ToolCall{Type: "function"}
+	}
+	v := a[i]
+	if tc.ID != "" {
+		v.ID = tc.ID
+	}
+	v.Function.Name += tc.Function.Name
+	v.Function.Arguments += tc.Function.Arguments
+}
+func (a toolAccumulator) calls() []ToolCall {
+	indices := make([]int, 0, len(a))
+	for i := range a {
+		indices = append(indices, i)
+	}
+	sort.Ints(indices)
+	out := make([]ToolCall, 0, len(a))
+	for _, i := range indices {
+		out = append(out, *a[i])
+	}
+	return out
 }

@@ -12,6 +12,7 @@ import (
 
 // Skill represents a saved reusable workflow.
 type Skill struct {
+	Builtin     bool      `json:"builtin,omitempty"`
 	ID          string    `json:"id"`
 	AgentID     string    `json:"agent_id"`
 	UserID      string    `json:"user_id"`
@@ -38,7 +39,7 @@ func (s *Store) Save(ctx context.Context, agentID, userID, name, description, co
 	_, err := s.db.Exec(ctx,
 		`INSERT INTO skills (id, agent_id, user_id, name, description, content, tags)
 		 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-		id, agentID, userID, name, description, content, tags,
+		id, nullableID(agentID), userID, name, description, content, tags,
 	)
 	if err != nil {
 		return nil, err
@@ -56,11 +57,11 @@ func (s *Store) List(ctx context.Context, userID, agentID string) ([]Skill, erro
 
 	if agentID != "" {
 		rows, err = s.db.Query(ctx,
-			`SELECT id, agent_id, user_id, name, description, content, COALESCE(tags, '{}'), use_count, created_at, updated_at
-			 FROM skills WHERE agent_id = $1 ORDER BY use_count DESC, created_at DESC`, agentID)
+			`SELECT id, COALESCE(agent_id::text, ''), user_id, name, COALESCE(description, ''), content, COALESCE(tags, '{}'), use_count, created_at, updated_at
+			 FROM skills WHERE agent_id = $1 AND user_id = $2 ORDER BY use_count DESC, created_at DESC`, agentID, userID)
 	} else {
 		rows, err = s.db.Query(ctx,
-			`SELECT id, agent_id, user_id, name, description, content, COALESCE(tags, '{}'), use_count, created_at, updated_at
+			`SELECT id, COALESCE(agent_id::text, ''), user_id, name, COALESCE(description, ''), content, COALESCE(tags, '{}'), use_count, created_at, updated_at
 			 FROM skills WHERE user_id = $1 ORDER BY use_count DESC, created_at DESC`, userID)
 	}
 	if err != nil {
@@ -68,23 +69,33 @@ func (s *Store) List(ctx context.Context, userID, agentID string) ([]Skill, erro
 	}
 	defer rows.Close()
 
-	var skills []Skill
+	skills := Builtins()
 	for rows.Next() {
 		var sk Skill
-		rows.Scan(&sk.ID, &sk.AgentID, &sk.UserID, &sk.Name, &sk.Description, &sk.Content, &sk.Tags, &sk.UseCount, &sk.CreatedAt, &sk.UpdatedAt)
+		if err := rows.Scan(&sk.ID, &sk.AgentID, &sk.UserID, &sk.Name, &sk.Description, &sk.Content, &sk.Tags, &sk.UseCount, &sk.CreatedAt, &sk.UpdatedAt); err != nil {
+			return nil, err
+		}
 		skills = append(skills, sk)
 	}
 	if skills == nil {
 		skills = []Skill{}
 	}
-	return skills, nil
+	return skills, rows.Err()
 }
 
 // Get fetches a single skill.
 func (s *Store) Get(ctx context.Context, id string) (*Skill, error) {
+	if strings.HasPrefix(id, "builtin:") {
+		for _, sk := range Builtins() {
+			if sk.ID == id {
+				return &sk, nil
+			}
+		}
+		return nil, fmt.Errorf("skill not found")
+	}
 	var sk Skill
 	err := s.db.QueryRow(ctx,
-		`SELECT id, agent_id, user_id, name, description, content, COALESCE(tags, '{}'), use_count, created_at, updated_at
+		`SELECT id, COALESCE(agent_id::text, ''), user_id, name, COALESCE(description, ''), content, COALESCE(tags, '{}'), use_count, created_at, updated_at
 		 FROM skills WHERE id = $1`, id).
 		Scan(&sk.ID, &sk.AgentID, &sk.UserID, &sk.Name, &sk.Description, &sk.Content, &sk.Tags, &sk.UseCount, &sk.CreatedAt, &sk.UpdatedAt)
 	if err != nil {
@@ -95,12 +106,18 @@ func (s *Store) Get(ctx context.Context, id string) (*Skill, error) {
 
 // Delete removes a skill.
 func (s *Store) Delete(ctx context.Context, id, userID string) error {
+	if strings.HasPrefix(id, "builtin:") {
+		return fmt.Errorf("built-in skills cannot be deleted")
+	}
 	_, err := s.db.Exec(ctx, `DELETE FROM skills WHERE id = $1 AND user_id = $2`, id, userID)
 	return err
 }
 
 // IncrementUseCount bumps the usage counter.
 func (s *Store) IncrementUseCount(ctx context.Context, id string) {
+	if strings.HasPrefix(id, "builtin:") {
+		return
+	}
 	s.db.Exec(ctx, `UPDATE skills SET use_count = use_count + 1 WHERE id = $1`, id)
 }
 
@@ -150,11 +167,20 @@ type pgx_rows interface {
 	Next() bool
 	Scan(...any) error
 	Close()
+	Err() error
 }
 
 func truncate(s string, n int) string {
-	if len(s) <= n {
+	r := []rune(s)
+	if len(r) <= n {
 		return s
 	}
-	return s[:n] + "..."
+	return string(r[:n]) + "..."
+}
+
+func nullableID(id string) any {
+	if id == "" {
+		return nil
+	}
+	return id
 }

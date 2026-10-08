@@ -27,7 +27,7 @@ func Load() *Config {
 		LLMAPIKey:     getEnv("LLM_API_KEY", ""),
 		LLMModel:      getEnv("LLM_MODEL", "gpt-4o"),
 		SandboxImage:  getEnv("SANDBOX_IMAGE", "grok-agent-sandbox:latest"),
-		WorkspacePath: getEnv("WORKSPACE_PATH", "/opt/grok-agent/workspaces"),
+		WorkspacePath: getEnv("WORKSPACE_PATH", ""),
 		SearxngURL:    getEnv("SEARXNG_URL", "http://localhost:8888"),
 		EmbedAPIKey:   getEnv("EMBED_API_KEY", ""),
 		EmbedBaseURL:  getEnv("EMBED_BASE_URL", "https://api.openai.com/v1"),

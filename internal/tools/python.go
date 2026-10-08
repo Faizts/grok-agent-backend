@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 
 	"github.com/grok-agent/backend/internal/sandbox"
 )
@@ -19,7 +20,7 @@ func NewPythonTool(m *sandbox.Manager, containerID string) *PythonTool {
 
 func (t *PythonTool) Name() string { return "python" }
 func (t *PythonTool) Description() string {
-	return "Execute Python 3 code in the sandbox. NumPy, Pandas, Matplotlib, Requests, BeautifulSoup pre-installed. Great for data analysis, computation, and scripting."
+	return "Execute Python 3 code in the sandbox. Requests, BeautifulSoup and Pillow are installed. Install other packages with pip when needed (shell approval required)."
 }
 func (t *PythonTool) Schema() json.RawMessage {
 	return json.RawMessage(`{
@@ -42,6 +43,9 @@ func (t *PythonTool) Execute(ctx context.Context, input ToolInput) (*ToolResult,
 	out := res.Stdout
 	if res.Stderr != "" {
 		out += "\n[stderr]: " + res.Stderr
+	}
+	if res.ExitCode != 0 {
+		return &ToolResult{Output: out, Error: fmt.Sprintf("exit code %d: %s", res.ExitCode, out)}, nil
 	}
 	return &ToolResult{Output: out}, nil
 }

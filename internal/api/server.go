@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/grok-agent/backend/internal/api/handlers"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 
@@ -37,12 +38,6 @@ func NewServer() (*Server, error) {
 		return nil, fmt.Errorf("postgres: %w", err)
 	}
 
-	redisClient, err := db.NewRedis(cfg.RedisURL)
-	if err != nil {
-		logger.L.Warn("redis unavailable, continuing without it", zap.Error(err))
-	}
-	_ = redisClient
-
 	s := &Server{
 		cfg:    cfg,
 		pool:   pool,
@@ -67,6 +62,10 @@ func (s *Server) Run() error {
 		}
 	}()
 
+	maintenanceCtx, stopMaintenance := context.WithCancel(context.Background())
+	defer stopMaintenance()
+	maintenanceDone := make(chan struct{})
+	go func() { defer close(maintenanceDone); handlers.ReapIdleComputers(maintenanceCtx, s.pool, s.cfg) }()
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
@@ -79,6 +78,8 @@ func (s *Server) Run() error {
 		return fmt.Errorf("server shutdown: %w", err)
 	}
 
+	stopMaintenance()
+	<-maintenanceDone
 	s.pool.Close()
 	logger.L.Info("server stopped")
 	return nil

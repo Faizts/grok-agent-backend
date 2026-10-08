@@ -60,18 +60,19 @@ func NewTracker(db *pgxpool.Pool) *Tracker {
 	return &Tracker{db: db}
 }
 
-func (t *Tracker) Record(ctx context.Context, e Event) {
+func (t *Tracker) Record(ctx context.Context, e Event) error {
 	if e.ID == "" {
 		e.ID = uuid.New().String()
 	}
-	t.db.Exec(ctx,
+	_, err := t.db.Exec(ctx,
 		`INSERT INTO usage_events
 		 (id, user_id, agent_id, conversation_id, event_type, model, prompt_tokens, completion_tokens, tool_name, duration_ms)
 		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
-		e.ID, e.UserID, e.AgentID, e.ConversationID,
+		e.ID, nullableID(e.UserID), nullableID(e.AgentID), nullableID(e.ConversationID),
 		string(e.EventType), e.Model, e.PromptTokens, e.CompletionTokens,
 		e.ToolName, e.DurationMs,
 	)
+	return err
 }
 
 func (t *Tracker) GetStats(ctx context.Context, userID string) (*Stats, error) {
@@ -84,7 +85,7 @@ func (t *Tracker) GetStats(ctx context.Context, userID string) (*Stats, error) {
 			COALESCE(SUM(prompt_tokens), 0),
 			COALESCE(SUM(completion_tokens), 0),
 			COALESCE(SUM(prompt_tokens + completion_tokens), 0),
-			COALESCE(AVG(duration_ms) FILTER (WHERE event_type = 'llm_call'), 0)
+			COALESCE(AVG(duration_ms) FILTER (WHERE event_type = 'llm_call'), 0)::int
 		FROM usage_events WHERE user_id = $1`, userID).
 		Scan(&s.TotalLLMCalls, &s.TotalToolCalls, &s.TotalTasksComplete,
 			&s.TotalPromptTokens, &s.TotalOutputTokens, &s.TotalTokens, &s.AvgDurationMs)
@@ -137,4 +138,11 @@ func (t *Tracker) GetDailyUsage(ctx context.Context, userID string, days int) ([
 		usage = []DailyUsage{}
 	}
 	return usage, nil
+}
+
+func nullableID(id string) any {
+	if id == "" {
+		return nil
+	}
+	return id
 }

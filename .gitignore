@@ -1,0 +1,6 @@
+/server
+/grok-agent-server
+.env
+.env.*
+!.env.example
+.DS_Store

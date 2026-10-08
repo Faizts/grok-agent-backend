@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"time"
 )
 
 // SearchTool performs web searches via a local SearXNG instance.
@@ -46,11 +47,14 @@ func (t *SearchTool) Execute(ctx context.Context, input ToolInput) (*ToolResult,
 		return &ToolResult{Error: err.Error()}, nil
 	}
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
 	if err != nil {
 		return &ToolResult{Error: fmt.Sprintf("search request failed: %v", err)}, nil
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return &ToolResult{Error: fmt.Sprintf("search HTTP status %d", resp.StatusCode)}, nil
+	}
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
 	if err != nil {
@@ -66,12 +70,12 @@ func (t *SearchTool) Execute(ctx context.Context, input ToolInput) (*ToolResult,
 		} `json:"results"`
 	}
 	if err := json.Unmarshal(body, &result); err != nil {
-		return &ToolResult{Output: string(body)}, nil
+		return &ToolResult{Error: "invalid search response: " + err.Error()}, nil
 	}
 
 	limit := 5
 	if n, ok := input["num_results"].(float64); ok && int(n) > 0 {
-		limit = int(n)
+		limit = min(int(n), 20)
 	}
 
 	out := ""

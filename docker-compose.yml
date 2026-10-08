@@ -1,4 +1,8 @@
-version: "3.9"
+x-logging: &bounded-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
 
 services:
   # Pre-build & tag sandbox template image for Go container manager
@@ -6,16 +10,21 @@ services:
     build:
       context: ./sandbox
       dockerfile: Dockerfile
+      args:
+        INSTALL_DATA_PACKAGES: ${SANDBOX_DATA_PACKAGES:-false}
     image: grok-agent-sandbox:latest
     entrypoint: ["echo", "Sandbox template built"]
+    tmpfs:
+      - /workspace
 
   postgres:
+    logging: *bounded-logging
     image: pgvector/pgvector:pg16
     restart: unless-stopped
     environment:
       POSTGRES_DB: grokagent
       POSTGRES_USER: grokagent
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-secret}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./migrations:/docker-entrypoint-initdb.d
@@ -25,31 +34,46 @@ services:
       timeout: 5s
       retries: 10
 
-  redis:
-    image: redis:7-alpine
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
-      timeout: 3s
-      retries: 5
-
-  # OmniRoute Unified Model Gateway (OpenRouter, Gemini, Codex, Antigravity, Anthropic)
-  omniroute:
-    image: python:3.11-slim
-    command: >
-      bash -c "pip install --no-cache-dir fastapi uvicorn requests httpx litellm &&
-               uvicorn --host 0.0.0.0 --port 8000 --factory litellm.proxy.proxy_server:app"
-    restart: unless-stopped
-    ports:
-      - "8000:8000"
+  migrate:
+    image: postgres:16-alpine
     environment:
-      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
-      GEMINI_API_KEY: ${GEMINI_API_KEY}
-      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
-      OPENAI_API_KEY: ${LLM_API_KEY}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - ./migrations:/migrations:ro
+    tmpfs:
+      - /var/lib/postgresql/data
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["for file in /migrations/*.sql; do psql -h postgres -U grokagent -d grokagent -v ON_ERROR_STOP=1 -f $$file || exit 1; done"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  frontend:
+    logging: *bounded-logging
+    build:
+      context: ../grok-agent-frontend
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8080/api/v1}
+        NEXT_PUBLIC_WS_URL: ${NEXT_PUBLIC_WS_URL:-ws://localhost:8080/api/v1/ws}
+        NEXT_PUBLIC_DESKTOP_BASE_URL: ${NEXT_PUBLIC_DESKTOP_BASE_URL:-http://localhost}
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+
+  admin:
+    logging: *bounded-logging
+    build:
+      context: ../grok-agent-admin
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8080/api/v1}
+    ports:
+      - "3001:3000"
+    depends_on:
+      - backend
 
   backend:
+    logging: *bounded-logging
     build:
       context: .
       dockerfile: Dockerfile
@@ -58,38 +82,38 @@ services:
       - "8080:8080"
     environment:
       PORT: "8080"
-      DATABASE_URL: postgres://grokagent:${POSTGRES_PASSWORD:-secret}@postgres:5432/grokagent
-      REDIS_URL: redis://redis:6379
-      LLM_BASE_URL: ${LLM_BASE_URL:-http://omniroute:8000/v1}
-      LLM_API_KEY: ${LLM_API_KEY:-omniroute}
+      DATABASE_URL: postgres://grokagent:${POSTGRES_PASSWORD}@postgres:5432/grokagent
+      LLM_BASE_URL: ${LLM_BASE_URL:-https://api.openai.com/v1}
+      LLM_API_KEY: ${LLM_API_KEY:?Set LLM_API_KEY in .env}
       LLM_MODEL: ${LLM_MODEL:-gpt-4o}
-      EMBED_API_KEY: ${LLM_API_KEY}
-      EMBED_BASE_URL: ${LLM_BASE_URL:-http://omniroute:8000/v1}
-      JWT_SECRET: ${JWT_SECRET:-change-me-in-production}
+      EMBED_API_KEY: ${EMBED_API_KEY:-${LLM_API_KEY}}
+      EMBED_BASE_URL: ${EMBED_BASE_URL:-https://api.openai.com/v1}
+      JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET in .env}
       SANDBOX_IMAGE: grok-agent-sandbox:latest
-      WORKSPACE_PATH: /workspaces
+      SANDBOX_MEMORY_MB: ${SANDBOX_MEMORY_MB:-1024}
+      SANDBOX_CPUS: ${SANDBOX_CPUS:-1}
+      SANDBOX_IDLE_MINUTES: ${SANDBOX_IDLE_MINUTES:-10}
+      WORKSPACE_PATH: ""
       SEARXNG_URL: http://searxng:8080
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - workspaces:/workspaces
     depends_on:
       postgres:
         condition: service_healthy
-      redis:
-        condition: service_healthy
-      omniroute:
-        condition: service_started
+      migrate:
+        condition: service_completed_successfully
       sandbox-template:
         condition: service_completed_successfully
 
   searxng:
+    logging: *bounded-logging
     image: searxng/searxng:latest
     restart: unless-stopped
     volumes:
       - ./searxng:/etc/searxng
     environment:
       - SEARXNG_BASE_URL=http://localhost:8888/
+      - SEARXNG_SECRET=${SEARXNG_SECRET:?Set SEARXNG_SECRET in .env}
 
 volumes:
   postgres_data:
-  workspaces:

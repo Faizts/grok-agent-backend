@@ -4,14 +4,19 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"io"
+	"github.com/docker/docker/errdefs"
 	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/client"
+	"github.com/docker/docker/pkg/stdcopy"
 	"github.com/docker/go-connections/nat"
 )
 
@@ -39,9 +44,13 @@ func NewManager(image, workspacePath string) (*Manager, error) {
 
 // Create provisions a new sandbox container for the given agentID.
 func (m *Manager) Create(ctx context.Context, agentID string) (*SandboxInfo, error) {
-	hostWorkspace := fmt.Sprintf("%s/%s", m.workspacePath, agentID)
-	if err := os.MkdirAll(hostWorkspace, 0o755); err != nil {
-		return nil, fmt.Errorf("create workspace dir: %w", err)
+	workspaceMount := mount.Mount{Type: mount.TypeVolume, Source: "grok-agent-workspace-" + agentID, Target: "/workspace"}
+	if m.workspacePath != "" {
+		hostWorkspace := fmt.Sprintf("%s/%s", m.workspacePath, agentID)
+		if err := os.MkdirAll(hostWorkspace, 0o755); err != nil {
+			return nil, fmt.Errorf("create workspace dir: %w", err)
+		}
+		workspaceMount = mount.Mount{Type: mount.TypeBind, Source: hostWorkspace, Target: "/workspace"}
 	}
 
 	resp, err := m.docker.ContainerCreate(ctx,
@@ -57,22 +66,17 @@ func (m *Manager) Create(ctx context.Context, agentID string) (*SandboxInfo, err
 			},
 		},
 		&container.HostConfig{
-			Mounts: []mount.Mount{
-				{
-					Type:   mount.TypeBind,
-					Source: hostWorkspace,
-					Target: "/workspace",
-				},
-			},
+			Mounts: []mount.Mount{workspaceMount},
 			PortBindings: nat.PortMap{
 				"5900/tcp": []nat.PortBinding{{HostIP: "127.0.0.1", HostPort: "0"}},
 				"6080/tcp": []nat.PortBinding{{HostIP: "127.0.0.1", HostPort: "0"}},
 			},
 			Resources: container.Resources{
-				Memory:   2 * 1024 * 1024 * 1024, // 2 GB
-				NanoCPUs: 2 * 1e9,                 // 2 vCPUs
+				Memory:   int64(positiveEnv("SANDBOX_MEMORY_MB", 1024)) * 1024 * 1024,
+				NanoCPUs: int64(positiveEnv("SANDBOX_CPUS", 1)) * 1e9,
 			},
 			NetworkMode: "bridge",
+			ShmSize:     256 * 1024 * 1024,
 		},
 		nil, nil,
 		fmt.Sprintf("grok-agent-%s", agentID),
@@ -130,9 +134,12 @@ func (m *Manager) GetOrCreate(ctx context.Context, agentID string) (*SandboxInfo
 			return si, nil
 		}
 		// Restart stopped container
-		if c.State == "exited" {
+		if c.State == "exited" || c.State == "created" {
 			if err := m.docker.ContainerStart(ctx, c.ID, container.StartOptions{}); err == nil {
-				info, _ := m.docker.ContainerInspect(ctx, c.ID)
+				info, err := m.docker.ContainerInspect(ctx, c.ID)
+				if err != nil {
+					return nil, err
+				}
 				si := &SandboxInfo{ContainerID: c.ID}
 				if bindings, ok := info.NetworkSettings.Ports["5900/tcp"]; ok && len(bindings) > 0 {
 					si.VNCPort = bindings[0].HostPort
@@ -153,6 +160,20 @@ func (m *Manager) Stop(ctx context.Context, containerID string) error {
 	return m.docker.ContainerStop(ctx, containerID, container.StopOptions{})
 }
 
+// DesktopConnected reports an established VNC session, including noVNC clients.
+func (m *Manager) DesktopConnected(ctx context.Context, containerID string) (bool, error) {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	result, err := m.Exec(ctx, containerID, []string{"sh", "-c", `awk '$2 ~ /:170C$/ && $4 == "01" { active=1 } END { print active ? "active" : "idle" }' /proc/net/tcp /proc/net/tcp6`})
+	if err != nil {
+		return false, err
+	}
+	if result.ExitCode != 0 {
+		return false, fmt.Errorf("check desktop connection: %s", result.Stderr)
+	}
+	return strings.TrimSpace(result.Stdout) == "active", nil
+}
+
 // Remove stops and removes a sandbox container.
 func (m *Manager) Remove(ctx context.Context, containerID string) error {
 	return m.docker.ContainerRemove(ctx, containerID, container.RemoveOptions{Force: true})
@@ -166,7 +187,12 @@ type ExecResult struct {
 }
 
 // Exec runs a command inside a sandbox container.
+func (m *Manager) Close() error { return m.docker.Close() }
+
 func (m *Manager) Exec(ctx context.Context, containerID string, cmd []string) (*ExecResult, error) {
+	ctx, cancel := context.WithTimeout(ctx, 120*time.Second)
+	defer cancel()
+	cmd = append([]string{"timeout", "--signal=TERM", "--kill-after=5", "115"}, cmd...)
 	execResp, err := m.docker.ContainerExecCreate(ctx, containerID, types.ExecConfig{
 		Cmd:          cmd,
 		AttachStdout: true,
@@ -182,8 +208,22 @@ func (m *Manager) Exec(ctx context.Context, containerID string, cmd []string) (*
 	}
 	defer attach.Close()
 
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case <-ctx.Done():
+			attach.Close()
+		case <-done:
+		}
+	}()
 	var stdout, stderr bytes.Buffer
-	io.Copy(&stdout, attach.Reader)
+	if _, err := stdcopy.StdCopy(&stdout, &stderr, attach.Reader); err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	inspect, err := m.docker.ContainerExecInspect(ctx, execResp.ID)
 	if err != nil {
@@ -205,4 +245,43 @@ func (m *Manager) ExecShell(ctx context.Context, containerID, script string) (*E
 // ExecPython runs a Python snippet inside the sandbox.
 func (m *Manager) ExecPython(ctx context.Context, containerID, code string) (*ExecResult, error) {
 	return m.Exec(ctx, containerID, []string{"python3", "-c", code})
+}
+
+func positiveEnv(name string, fallback int) int {
+	n, err := strconv.Atoi(os.Getenv(name))
+	if err != nil || n <= 0 {
+		return fallback
+	}
+	return n
+}
+
+// Retain existing per-agent computers to preserve their data during upgrades.
+func (m *Manager) ComputerKey(ctx context.Context, userID, agentID string) (string, error) {
+	legacy, err := m.docker.ContainerList(ctx, container.ListOptions{All: true, Filters: filters.NewArgs(filters.Arg("label", "agent-id="+agentID), filters.Arg("label", "grok-agent=sandbox"))})
+	if err != nil {
+		return "", err
+	}
+	if len(legacy) > 0 {
+		return agentID, nil
+	}
+	return "user-" + userID, nil
+}
+func (m *Manager) RemoveComputer(ctx context.Context, key string) error {
+	computers, err := m.docker.ContainerList(ctx, container.ListOptions{All: true, Filters: filters.NewArgs(filters.Arg("label", "agent-id="+key), filters.Arg("label", "grok-agent=sandbox"))})
+	if err != nil {
+		return err
+	}
+	for _, computer := range computers {
+		if err = m.Remove(ctx, computer.ID); err != nil && !errdefs.IsNotFound(err) {
+			return err
+		}
+	}
+	if m.workspacePath != "" {
+		return os.RemoveAll(filepath.Join(m.workspacePath, key))
+	}
+	err = m.docker.VolumeRemove(ctx, "grok-agent-workspace-"+key, false)
+	if errdefs.IsNotFound(err) {
+		return nil
+	}
+	return err
 }

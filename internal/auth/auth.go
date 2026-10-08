@@ -8,6 +8,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -51,7 +52,7 @@ func ParseToken(tokenStr, secret string) (*Claims, error) {
 	return token.Claims.(*Claims), nil
 }
 
-func Middleware(secret string) gin.HandlerFunc {
+func Middleware(secret string, pools ...*pgxpool.Pool) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		header := c.GetHeader("Authorization")
 		if header == "" {
@@ -69,6 +70,14 @@ func Middleware(secret string) gin.HandlerFunc {
 		if err != nil {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid token"})
 			return
+		}
+		if len(pools) > 0 {
+			var role, status string
+			if err := pools[0].QueryRow(c.Request.Context(), `SELECT role,status FROM users WHERE id=$1`, claims.UserID).Scan(&role, &status); err != nil || status != "active" {
+				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "account unavailable"})
+				return
+			}
+			claims.Role = role
 		}
 		c.Set("user_id", claims.UserID)
 		c.Set("role", claims.Role)

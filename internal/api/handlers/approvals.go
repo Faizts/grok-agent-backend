@@ -64,26 +64,34 @@ func (h *ApprovalHandler) Respond(c *gin.Context) {
 		return
 	}
 
+	ctx := c.Request.Context()
+	tx, err := h.db.Begin(ctx)
+	if err != nil {
+		c.JSON(500, gin.H{"error": "database unavailable"})
+		return
+	}
+	defer tx.Rollback(ctx)
+	var toolName, agentID string
+	err = tx.QueryRow(ctx, `SELECT a.tool_name,a.agent_id FROM approvals a JOIN agents ag ON ag.id=a.agent_id WHERE a.id=$1 AND ag.user_id=$2 AND a.status='pending' FOR UPDATE OF a`, approvalID, c.GetString("user_id")).Scan(&toolName, &agentID)
+	if err != nil {
+		c.JSON(404, gin.H{"error": "pending approval not found"})
+		return
+	}
 	status := req.Decision
 	if status == "always" {
-		// Get the tool_name + agent_id and add to tool_rules
-		var toolName, agentID string
-		h.db.QueryRow(context.Background(),
-			`SELECT tool_name, agent_id FROM approvals WHERE id = $1`, approvalID).
-			Scan(&toolName, &agentID)
-
-		h.db.Exec(context.Background(),
-			`INSERT INTO tool_rules (agent_id, tool_name, rule)
-			 VALUES ($1, $2, 'always_allow')
-			 ON CONFLICT (agent_id, tool_name) DO UPDATE SET rule = 'always_allow'`,
-			agentID, toolName)
 		status = "approved"
+		_, err = tx.Exec(ctx, `INSERT INTO tool_rules(agent_id,tool_name,rule) VALUES($1,$2,'always_allow') ON CONFLICT(agent_id,tool_name) DO UPDATE SET rule='always_allow'`, agentID, toolName)
+		if err != nil {
+			c.JSON(500, gin.H{"error": "failed to save rule"})
+			return
+		}
 	}
-
-	_, err := h.db.Exec(context.Background(),
-		`UPDATE approvals SET status = $1 WHERE id = $2`, status, approvalID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+	if _, err = tx.Exec(ctx, `UPDATE approvals SET status=$1 WHERE id=$2`, status, approvalID); err != nil {
+		c.JSON(500, gin.H{"error": "failed to update approval"})
+		return
+	}
+	if err = tx.Commit(ctx); err != nil {
+		c.JSON(500, gin.H{"error": "failed to save approval"})
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"status": status})

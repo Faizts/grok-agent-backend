@@ -43,9 +43,23 @@ func (h *AuthHandler) Register(c *gin.Context) {
 		return
 	}
 
-	// Check if this is the first user registered in the system
+	ctx := c.Request.Context()
+	tx, err := h.db.Begin(ctx)
+	if err != nil {
+		c.JSON(500, gin.H{"error": "database unavailable"})
+		return
+	}
+	defer tx.Rollback(ctx)
+	if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock(734218)`); err != nil {
+		c.JSON(500, gin.H{"error": "registration unavailable"})
+		return
+	}
+	// Serialize first-admin creation.
 	var userCount int
-	_ = h.db.QueryRow(context.Background(), `SELECT COUNT(*) FROM users`).Scan(&userCount)
+	if err = tx.QueryRow(ctx, `SELECT COUNT(*) FROM users`).Scan(&userCount); err != nil {
+		c.JSON(500, gin.H{"error": "registration unavailable"})
+		return
+	}
 
 	role := "user"
 	if userCount == 0 {
@@ -53,7 +67,7 @@ func (h *AuthHandler) Register(c *gin.Context) {
 	}
 
 	var userID string
-	err = h.db.QueryRow(context.Background(),
+	err = tx.QueryRow(ctx,
 		`INSERT INTO users (email, password, role, monthly_budget_usd)
 		 VALUES ($1, $2, $3, 10.00) RETURNING id`,
 		req.Email, hash, role,
@@ -63,6 +77,10 @@ func (h *AuthHandler) Register(c *gin.Context) {
 		return
 	}
 
+	if err = tx.Commit(ctx); err != nil {
+		c.JSON(500, gin.H{"error": "registration unavailable"})
+		return
+	}
 	token, err := auth.GenerateToken(userID, role, h.secret)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate token"})
@@ -70,11 +88,11 @@ func (h *AuthHandler) Register(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusCreated, gin.H{
-		"token":                  token,
-		"user_id":                userID,
-		"role":                   role,
-		"monthly_budget_usd":     10.00,
-		"spent_this_month_usd":   0.00,
+		"token":                token,
+		"user_id":              userID,
+		"role":                 role,
+		"monthly_budget_usd":   10.00,
+		"spent_this_month_usd": 0.00,
 	})
 }
 

@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"net/http"
+	"net/url"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -65,8 +66,17 @@ func (h *MCPHandler) Create(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	if req.Transport != "http" {
+		c.JSON(400, gin.H{"error": "only HTTP MCP transport is supported"})
+		return
+	}
+	endpoint, err := url.Parse(req.URL)
+	if err != nil || endpoint.Host == "" || (endpoint.Scheme != "https" && endpoint.Scheme != "http") {
+		c.JSON(400, gin.H{"error": "valid HTTP(S) MCP endpoint required"})
+		return
+	}
 	id := uuid.New().String()
-	_, err := h.db.Exec(context.Background(),
+	_, err = h.db.Exec(context.Background(),
 		`INSERT INTO mcp_servers (id, user_id, name, transport, url, command)
 		 VALUES ($1, $2, $3, $4, $5, $6)`,
 		id, userID, req.Name, req.Transport, req.URL, req.Command)

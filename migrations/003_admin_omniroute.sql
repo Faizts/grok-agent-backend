@@ -1,4 +1,4 @@
--- Migration 003: Admin Panel, Budgets, Per-User Models & OmniRoute
+-- Migration 003: Admin Panel, Budgets, Per-User Models
 
 ALTER TABLE users
 ADD COLUMN IF NOT EXISTS role TEXT DEFAULT 'user',
@@ -27,7 +27,7 @@ INSERT INTO model_rates (model, input_cost_per_1k, output_cost_per_1k) VALUES
     ('openrouter/auto', 0.001000, 0.004000)
 ON CONFLICT (model) DO NOTHING;
 
--- Global settings (OmniRoute endpoint, default budget, etc.)
+-- Global defaults
 CREATE TABLE IF NOT EXISTS global_settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL,
@@ -35,7 +35,6 @@ CREATE TABLE IF NOT EXISTS global_settings (
 );
 
 INSERT INTO global_settings (key, value) VALUES
-    ('omniroute_url', 'http://omniroute:8000/v1'),
     ('default_user_budget', '10.00'),
     ('default_user_model', 'gpt-4o')
 ON CONFLICT (key) DO NOTHING;

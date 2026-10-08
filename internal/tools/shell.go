@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 
 	"github.com/grok-agent/backend/internal/sandbox"
 )
@@ -44,7 +45,7 @@ func (t *ShellTool) Execute(ctx context.Context, input ToolInput) (*ToolResult, 
 		out += "\n[stderr]: " + res.Stderr
 	}
 	if res.ExitCode != 0 {
-		out += "\n[exit code]: " + string(rune('0'+res.ExitCode))
+		return &ToolResult{Output: out, Error: fmt.Sprintf("exit code %d: %s", res.ExitCode, out)}, nil
 	}
 	return &ToolResult{Output: out}, nil
 }

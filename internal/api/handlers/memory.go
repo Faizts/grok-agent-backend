@@ -26,9 +26,16 @@ type MemoryRow struct {
 
 func (h *MemoryHandler) List(c *gin.Context) {
 	agentID := c.Param("id")
+	if !owns(c, h.db, "agents", agentID) {
+		return
+	}
 	store := c.Query("store") // optional filter: main, solutions, skills, fragments
 
-	var rows interface{ Next() bool; Scan(...any) error; Close() }
+	var rows interface {
+		Next() bool
+		Scan(...any) error
+		Close()
+	}
 	var err error
 	if store != "" {
 		rows, err = h.db.Query(context.Background(),
@@ -60,6 +67,9 @@ func (h *MemoryHandler) List(c *gin.Context) {
 
 func (h *MemoryHandler) Delete(c *gin.Context) {
 	agentID := c.Param("id")
+	if !owns(c, h.db, "agents", agentID) {
+		return
+	}
 	memID := c.Param("mem_id")
 	_, err := h.db.Exec(context.Background(),
 		`DELETE FROM memories WHERE id = $1 AND agent_id = $2`, memID, agentID)

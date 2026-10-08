@@ -19,9 +19,15 @@ type FunctionCall struct {
 	Arguments string `json:"arguments"`
 }
 
+type TokenUsage struct {
+	PromptTokens     int `json:"prompt_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
+}
+
 type StreamChunk struct {
-	Content   string     `json:"content,omitempty"`
-	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
-	Done      bool       `json:"done"`
-	Error     string     `json:"error,omitempty"`
+	Usage     *TokenUsage `json:"usage,omitempty"`
+	Content   string      `json:"content,omitempty"`
+	ToolCalls []ToolCall  `json:"tool_calls,omitempty"`
+	Done      bool        `json:"done"`
+	Error     string      `json:"error,omitempty"`
 }

@@ -7,6 +7,8 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/grok-agent/backend/internal/config"
+	"github.com/grok-agent/backend/internal/sandbox"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -64,12 +66,18 @@ func (h *AgentHandler) Create(c *gin.Context) {
 		return
 	}
 
+	release, err := lockComputer(c.Request.Context(), h.db, userID)
+	if err != nil {
+		c.JSON(409, gin.H{"error": err.Error()})
+		return
+	}
+	defer release()
 	if req.SystemPrompt == "" {
 		req.SystemPrompt = "You are a helpful AI assistant with access to a Linux computer. Use your tools to complete tasks thoroughly and accurately."
 	}
 
 	id := uuid.New().String()
-	_, err := h.db.Exec(context.Background(),
+	_, err = h.db.Exec(context.Background(),
 		`INSERT INTO agents (id, user_id, name, system_prompt) VALUES ($1, $2, $3, $4)`,
 		id, userID, req.Name, req.SystemPrompt)
 	if err != nil {
@@ -99,10 +107,41 @@ func (h *AgentHandler) Get(c *gin.Context) {
 func (h *AgentHandler) Delete(c *gin.Context) {
 	userID := c.GetString("user_id")
 	agentID := c.Param("id")
-	_, err := h.db.Exec(context.Background(),
-		`DELETE FROM agents WHERE id = $1 AND user_id = $2`, agentID, userID)
+	if !owns(c, h.db, "agents", agentID) {
+		return
+	}
+	ctx := c.Request.Context()
+	release, err := lockComputer(ctx, h.db, userID)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.JSON(409, gin.H{"error": err.Error()})
+		return
+	}
+	defer release()
+	cfg := config.Load()
+	mgr, err := sandbox.NewManager(cfg.SandboxImage, cfg.WorkspacePath)
+	if err != nil {
+		c.JSON(503, gin.H{"error": "computer cleanup unavailable"})
+		return
+	}
+	defer mgr.Close()
+	if err = mgr.RemoveComputer(ctx, agentID); err != nil {
+		c.JSON(503, gin.H{"error": "could not remove agent computer"})
+		return
+	}
+	var count int
+	if err = h.db.QueryRow(ctx, `SELECT COUNT(*) FROM agents WHERE user_id=$1`, userID).Scan(&count); err != nil {
+		c.JSON(500, gin.H{"error": "database unavailable"})
+		return
+	}
+	if count == 1 {
+		if err = mgr.RemoveComputer(ctx, "user-"+userID); err != nil {
+			c.JSON(503, gin.H{"error": "could not remove shared computer"})
+			return
+		}
+	}
+	_, err = h.db.Exec(ctx, `DELETE FROM agents WHERE id=$1 AND user_id=$2`, agentID, userID)
+	if err != nil {
+		c.JSON(500, gin.H{"error": "could not delete agent"})
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"deleted": true})
