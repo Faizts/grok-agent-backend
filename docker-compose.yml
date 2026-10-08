@@ -65,6 +65,7 @@ services:
       EMBED_API_KEY: ${EMBED_API_KEY:-${LLM_API_KEY}}
       EMBED_BASE_URL: ${EMBED_BASE_URL:-https://api.openai.com/v1}
       JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET in .env}
+      WS_ALLOWED_ORIGINS: ${WS_ALLOWED_ORIGINS:-https://agent.getvicinify.com}
       SANDBOX_IMAGE: grok-agent-sandbox:latest
       SANDBOX_MEMORY_MB: ${SANDBOX_MEMORY_MB:-1024}
       SANDBOX_CPUS: ${SANDBOX_CPUS:-1}

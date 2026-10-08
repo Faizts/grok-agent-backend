@@ -18,8 +18,8 @@ The default `docker-compose.yml` builds the sandbox and runs PostgreSQL 16 with 
 
 Deploy each repository independently:
 
-- Backend: `Faizts/grok-agent-backend`, branch `main`, Compose path `./docker-compose.yml`. Route its domain to service `backend`, container port `8080`. Set `POSTGRES_PASSWORD`, `JWT_SECRET`, `LLM_API_KEY` and provider/model settings in its deployment environment. `SEARXNG_SECRET` is optional and generated persistently when absent.
-- Frontend: `Faizts/grok-agent-frontend`, branch `main`, use its root `Dockerfile`, container port `3000`. Set `NEXT_PUBLIC_API_URL` and `NEXT_PUBLIC_WS_URL` build arguments to the deployed backend's HTTPS API and WSS endpoints, including `/api/v1` and `/api/v1/ws` respectively. Desktop access requires the configured desktop proxy/tunnel URL.
+- Backend: `Faizts/grok-agent-backend`, branch `main`, Compose path `./docker-compose.yml`. Route its domain to service `backend`, container port `8080`. Set `POSTGRES_PASSWORD`, `JWT_SECRET`, `LLM_API_KEY` and provider/model settings in its deployment environment. Set `WS_ALLOWED_ORIGINS` to the frontend origin, e.g. `https://agent.getvicinify.com` (also the Compose default). `SEARXNG_SECRET` is optional and generated persistently when absent.
+- Frontend: `Faizts/grok-agent-frontend`, branch `main`, use its root `Dockerfile`, container port `3000`. Set `NEXT_PUBLIC_API_URL` at build time to the deployed backend's HTTPS API ending in `/api/v1`. `NEXT_PUBLIC_WS_URL` is optional: leave it empty to infer the WSS endpoint ending in `/api/v1/ws`, or set a custom WSS endpoint explicitly. Desktop access requires the configured desktop proxy/tunnel URL.
 - Admin: `Faizts/grok-agent-admin`, branch `main`, use its root `Dockerfile`, container port `3000`. Set `NEXT_PUBLIC_API_URL` at build time to the deployed backend API URL.
 
 Do not select `docker-compose.local.yml` in Dokploy; it is an overlay for running all three checkouts together locally. Public Next.js URLs are baked into builds, so rebuild the web apps after changing them. Keep deployment volumes when updating.
@@ -34,7 +34,7 @@ Computers are created on first message and stop after SANDBOX_IDLE_MINUTES (defa
 
 Existing per-agent containers continue to be used to preserve old workspaces. New agents use the shared computer. Upgrading the image does not replace existing containers automatically. Back up old workspace volumes before manually migrating/recreating them. Deleting a legacy agent removes its computer and workspace; deleting the last agent removes the user's shared computer and workspace. Other agent deletions keep the shared computer intact.
 
-Desktop ports bind to host loopback. Remote deployment needs an authenticated TLS desktop proxy or tunnel; do not expose unauthenticated VNC publicly. Browser API/WebSocket/desktop addresses are supplied using NEXT_PUBLIC_* build arguments in Compose. The admin maps host 3001 to container 3000. Rebuild web apps when public URLs change. WebSocket origins must use the same hostname as the backend (different ports are allowed).
+Desktop ports bind to host loopback. Remote deployment needs an authenticated TLS desktop proxy or tunnel; do not expose unauthenticated VNC publicly. Browser API/WebSocket/desktop addresses are supplied using NEXT_PUBLIC_* build arguments in Compose. The admin maps host 3001 to container 3000. Rebuild web apps when public URLs change. WebSocket connections allow the backend hostname (different ports are allowed) and explicit comma-separated HTTP(S) origins in `WS_ALLOWED_ORIGINS`. The deployment Compose default allows `https://agent.getvicinify.com`; configure other frontend domains explicitly. Unknown origins are rejected, and JWT/ownership checks remain required.
 
 ## Runtime
 

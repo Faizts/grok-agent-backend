@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"net/url"
 	"sync"
 	"time"
 
@@ -18,20 +17,6 @@ import (
 	"github.com/grok-agent/backend/internal/sandbox"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
-
-var upgrader = websocket.Upgrader{ReadBufferSize: 1024, WriteBufferSize: 4096, CheckOrigin: func(r *http.Request) bool {
-	origin := r.Header.Get("Origin")
-	if origin == "" {
-		return true
-	}
-	u, err := url.Parse(origin)
-	if err != nil {
-		return false
-	}
-	return u.Hostname() == r.URL.Hostname() || u.Hostname() == hostOnly(r.Host)
-}}
-
-func hostOnly(host string) string { u, _ := url.Parse("http://" + host); return u.Hostname() }
 
 var activeConversations sync.Map
 
@@ -58,6 +43,7 @@ func (h *WSHandler) Handle(c *gin.Context) {
 		return
 	}
 	defer activeConversations.Delete(convID)
+	upgrader := websocket.Upgrader{ReadBufferSize: 1024, WriteBufferSize: 4096, CheckOrigin: websocketOriginPolicy(h.cfg.WSAllowedOrigins)}
 	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
 	if err != nil {
 		return
