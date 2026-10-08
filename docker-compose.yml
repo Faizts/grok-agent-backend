@@ -111,9 +111,12 @@ services:
     restart: unless-stopped
     volumes:
       - ./searxng:/etc/searxng
+      - searxng_secret:/var/lib/grokagent-searxng
+    entrypoint: ["/bin/sh", "/etc/searxng/start.sh"]
     environment:
       - SEARXNG_BASE_URL=http://localhost:8888/
-      - SEARXNG_SECRET=${SEARXNG_SECRET:?Set SEARXNG_SECRET in .env}
+      - SEARXNG_SECRET=${SEARXNG_SECRET:-}
 
 volumes:
   postgres_data:
+  searxng_secret:
