@@ -7,12 +7,22 @@ Named AI agents with persistent memory, tools, and a shared computer per user. T
 ```sh
 cp .env.example .env
 # Set POSTGRES_PASSWORD, JWT_SECRET, LLM_API_KEY and your provider/model.
-docker compose up --build
+docker compose -f docker-compose.yml -f docker-compose.local.yml up --build
 ```
 
 User app: http://localhost:3000. Admin app: http://localhost:3001. API: http://localhost:8080/api/v1. The first registered user is administrator. Both apps use the same account system.
 
-Compose builds the sandbox and runs PostgreSQL 16 with pgvector, SearXNG, the Go backend, and both web apps. There is no bundled LLM gateway or Redis service. Set LLM_BASE_URL to your OpenAI-compatible provider. Every assigned model needs a model_rates entry and streaming token usage support.
+The default `docker-compose.yml` builds the sandbox and runs PostgreSQL 16 with pgvector, SearXNG, migrations and the Go backend. It uses only files inside this backend repository. The explicit local overlay adds both web apps and requires `grok-agent-frontend` and `grok-agent-admin` as sibling folders. There is no bundled LLM gateway or Redis service. Set LLM_BASE_URL to your OpenAI-compatible provider. Every assigned model needs a model_rates entry and streaming token usage support.
+
+## Separate Dokploy deployments
+
+Deploy each repository independently:
+
+- Backend: `Faizts/grok-agent-backend`, branch `main`, Compose path `./docker-compose.yml`. Route its domain to service `backend`, container port `8080`. Set `POSTGRES_PASSWORD`, `JWT_SECRET`, `LLM_API_KEY` and provider/model settings in its deployment environment. `SEARXNG_SECRET` is optional and generated persistently when absent.
+- Frontend: `Faizts/grok-agent-frontend`, branch `main`, use its root `Dockerfile`, container port `3000`. Set `NEXT_PUBLIC_API_URL` and `NEXT_PUBLIC_WS_URL` build arguments to the deployed backend's HTTPS API and WSS endpoints, including `/api/v1` and `/api/v1/ws` respectively. Desktop access requires the configured desktop proxy/tunnel URL.
+- Admin: `Faizts/grok-agent-admin`, branch `main`, use its root `Dockerfile`, container port `3000`. Set `NEXT_PUBLIC_API_URL` at build time to the deployed backend API URL.
+
+Do not select `docker-compose.local.yml` in Dokploy; it is an overlay for running all three checkouts together locally. Public Next.js URLs are baked into builds, so rebuild the web apps after changing them. Keep deployment volumes when updating.
 
 ## Shared computer and resource use
 

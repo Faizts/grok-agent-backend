@@ -48,30 +48,6 @@ services:
       postgres:
         condition: service_healthy
 
-  frontend:
-    logging: *bounded-logging
-    build:
-      context: ../grok-agent-frontend
-      args:
-        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8080/api/v1}
-        NEXT_PUBLIC_WS_URL: ${NEXT_PUBLIC_WS_URL:-ws://localhost:8080/api/v1/ws}
-        NEXT_PUBLIC_DESKTOP_BASE_URL: ${NEXT_PUBLIC_DESKTOP_BASE_URL:-http://localhost}
-    ports:
-      - "3000:3000"
-    depends_on:
-      - backend
-
-  admin:
-    logging: *bounded-logging
-    build:
-      context: ../grok-agent-admin
-      args:
-        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8080/api/v1}
-    ports:
-      - "3001:3000"
-    depends_on:
-      - backend
-
   backend:
     logging: *bounded-logging
     build:
